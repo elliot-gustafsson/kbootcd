@@ -1,0 +1,12 @@
+[Unit]
+Description=Fetch bootc updates
+Documentation=man:bootc(8)
+ConditionPathExists=/run/ostree-booted
+
+[Timer]
+OnBootSec=1h
+OnUnitInactiveSec=8h
+RandomizedDelaySec=2h
+
+[Install]
+WantedBy=timers.target

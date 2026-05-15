@@ -1,0 +1,12 @@
+version: 2
+ethernets:
+  eth0:
+    dhcp4: true
+    dhcp6: false
+    accept-ra: false
+    link-local:
+      - ipv4
+    nameservers:
+      addresses:
+        - 8.8.8.8
+        - 8.8.4.4

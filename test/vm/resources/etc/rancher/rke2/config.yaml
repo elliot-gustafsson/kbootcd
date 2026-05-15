@@ -1,0 +1,7 @@
+kubelet-arg:
+  - "root-dir=/var/lib/rancher/kubelet"
+protect-kernel-defaults: true
+selinux: true
+resolv-conf: /etc/resolv.conf
+cni: cilium
+disable-kube-proxy: true

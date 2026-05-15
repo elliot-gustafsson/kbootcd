@@ -1,0 +1,19 @@
+# UPDATE: Using AlmaLinux 10 as the base
+FROM docker.io/almalinux:10
+
+RUN dnf install -y \
+    qemu-kvm \
+    xorriso \
+    procps-ng \
+    telnet \
+    nmap-ncat \
+    openssh-clients \
+    && dnf clean all
+
+WORKDIR /data
+
+COPY localrun/cloud-init/user-data.yml user-data
+COPY localrun/cloud-init/meta-data.yml meta-data
+COPY localrun/cloud-init/network-config.yml network-config
+
+RUN xorrisofs -output seed.iso -volid cidata -joliet -rock user-data meta-data network-config

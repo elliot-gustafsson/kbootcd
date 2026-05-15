@@ -1,0 +1,13 @@
+[Unit]
+Description=Flush journal after /var/log mount
+BindsTo=var-log.mount
+After=var-log.mount
+
+[Service]
+Type=oneshot
+
+# Flush logs from RAM to disk
+ExecStart=/usr/bin/journalctl --flush
+
+[Install]
+WantedBy=var-log.mount

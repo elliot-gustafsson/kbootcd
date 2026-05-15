@@ -1,0 +1,83 @@
+FROM quay.io/almalinuxorg/almalinux-bootc:10.1@sha256:7926d00fec851f9163888f588af25826989fdbba6eb9b9c6cd758800a60062c6 as base
+
+FROM base AS init
+
+ADD resources /resources
+
+# Ensure correct persmissions
+RUN find /resources -type d -exec chmod 755 {} + && \
+    find /resources -type f -exec chmod 644 {} +
+
+FROM base
+
+# Copy files
+COPY --from=init /resources/ /
+
+
+# 1. Install OpenSCAP scanner and the Security Guide rules
+RUN dnf -y install \
+    cloud-init \
+    cloud-utils-growpart \
+    qemu-guest-agent \
+    openscap-scanner \
+    scap-security-guide \
+    && dnf clean all
+
+# Force Swedish Keyboard
+RUN echo "KEYMAP=se" > /etc/vconsole.conf
+
+# Copy files
+COPY --from=init /resources/ /
+
+# Force re-dlush after /var/log is mounted.
+RUN mkdir -p /usr/lib/systemd/system/var-log.mount.wants && \
+    ln -s /usr/lib/systemd/system/force-journal-flush.service /usr/lib/systemd/system/var-log.mount.wants/force-journal-flush.service
+
+# Disable timer for auto fetching and rebooting vm. Enable custom timer for only staging a new image.
+RUN systemctl mask bootc-fetch-apply-updates.timer && \
+    systemctl enable bootc-fetch-updates.timer
+
+# 2. Define the Security Profile
+# "xccdf_org.ssgproject.content_profile_cis" typically maps to CIS Level 2 Server in AlmaLinux 10 SSG.
+# You can verify available profiles by running `oscap info` on the datastream file.
+ARG PROFILE_ID="xccdf_org.ssgproject.content_profile_cis"
+ARG SCAP_DS="/usr/share/xml/scap/ssg/content/ssg-almalinux10-ds.xml"
+
+# 3. Run Build-Time Hardening (Remediation)
+# We accept exit code 0 (success) or 2 (compliance failure, which is expected before remediation)
+# The '|| true' ensures the build doesn't crash on non-remediable items (like grub/kernel runtime).
+RUN oscap xccdf eval \
+    --profile ${PROFILE_ID} \
+    --remediate \
+    --results /root/oscap-results.xml \
+    --report /root/oscap-report.html \
+    --fetch-remote-resources \
+    ${SCAP_DS} || true
+
+# 4. Final Cleanup
+# Remove the scanner tools to save space (optional: keep them if you want to re-scan later)
+RUN dnf -y remove openscap-scanner && \
+    rm -rf /var/cache/dnf /usr/share/doc/*
+
+# Disable and mask firewalld, cni is the captain now
+RUN systemctl disable firewalld && \
+    systemctl mask firewalld
+
+# NOTE: Need to update repo /etc/yum.repos.d/rancher-rke2.repo if updated
+ARG RKE2_VERSION=1.34.7~rke2r1
+
+# Install rke2
+RUN dnf install -y \
+    rke2-server-${RKE2_VERSION} \
+    rke2-agent-${RKE2_VERSION} \
+    rke2-selinux && \
+    dnf clean all && \
+    printf "\nCONTAINERD_LOG_LEVEL=warn\n" >> /etc/sysconfig/rke2-server && \
+    printf "\nCONTAINERD_LOG_LEVEL=warn\n" >> /etc/sysconfig/rke2-agent
+
+
+ARG K9S_VERSION=v0.50.18
+
+# Download and install k9s
+RUN curl -sS -L "https://github.com/derailed/k9s/releases/download/${K9S_VERSION}/k9s_Linux_amd64.tar.gz" | tar xz -C /usr/local/bin k9s \
+    && chmod +x /usr/local/bin/k9s

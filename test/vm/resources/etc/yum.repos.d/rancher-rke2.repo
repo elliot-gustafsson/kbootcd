@@ -1,0 +1,15 @@
+[rancher-rke2-common-stable]
+name=Rancher RKE2 Common (stable)
+baseurl=https://rpm.rancher.io/rke2/stable/common/centos/9/noarch
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey=https://rpm.rancher.io/public.key
+
+[rancher-rke2-1.34-stable]
+name=Rancher RKE2 1.34 (stable)
+baseurl=https://rpm.rancher.io/rke2/stable/1.34/centos/9/x86_64
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey=https://rpm.rancher.io/public.key
