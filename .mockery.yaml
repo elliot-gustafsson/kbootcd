@@ -1,0 +1,9 @@
+filename: "mock_{{.InterfaceName}}.go"
+
+packages:
+  github.com/elliot-gustafsson/kbootcd/internal/command:
+    interfaces:
+      Commander:
+        config:
+          dir: mocks/mock_command
+          pkgname: mock_command
