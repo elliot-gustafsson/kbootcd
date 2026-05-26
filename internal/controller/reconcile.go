@@ -47,6 +47,7 @@ type Config struct {
 	TargetImageConfigPath string
 	LeaseName             string
 	LeaseNamespace        string
+	LeaseDuration         time.Duration
 	Clock                 clock.PassiveClock
 	Window                Window
 }
@@ -124,11 +125,11 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 		return nil
 	}
 
-	acquired, err := tryAcquireLease(ctx, kube, config)
+	lease, err := tryAcquireLease(ctx, kube, config)
 	if err != nil {
 		return fmt.Errorf("error acquiring api lease, err: %w", err)
 	}
-	if !acquired {
+	if lease == nil {
 		logger.Info("lock active on peer node, queueing drain execution...")
 		return nil
 	}
@@ -147,7 +148,7 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 	}
 	logger.Info("cluster health verified. starting drain...")
 
-	if err := drainNode(ctx, logger, kube, config); err != nil {
+	if err := drainNode(ctx, logger, kube, lease, config); err != nil {
 		return fmt.Errorf("error draining node, err: %w", err)
 	}
 
@@ -219,8 +220,28 @@ func isClusterHealthy(ctx context.Context, kube kubernetes.Interface, ourNodeNam
 }
 
 // drainNode builds safe declarative eviction maps targeting unmanaged local infrastructure
-func drainNode(ctx context.Context, logger *slog.Logger, kube kubernetes.Interface, config Config) error {
-	// TODO: update lease time once every minute so a long drain time doesnt make the lease expire and another node start draining.
+func drainNode(ctx context.Context, logger *slog.Logger, kube kubernetes.Interface, lease *coordinationv1.Lease, config Config) error {
+
+	drainCtx, drainCtxCancel := context.WithCancel(ctx)
+	defer drainCtxCancel()
+
+	go func() {
+		leases := kube.CoordinationV1().Leases(config.LeaseNamespace)
+		t := time.Tick(60 * time.Second)
+		for {
+			select {
+			case <-drainCtx.Done():
+				return
+			case <-t:
+				lease.Spec.HolderIdentity = &config.NodeName
+				lease.Spec.RenewTime = &metav1.MicroTime{Time: config.Clock.Now()}
+				_, err := leases.Update(ctx, lease, metav1.UpdateOptions{})
+				if err != nil {
+					logger.Error("error refreshing lease", "error", err.Error())
+				}
+			}
+		}
+	}()
 
 	node, err := kube.CoreV1().Nodes().Get(ctx, config.NodeName, metav1.GetOptions{})
 	if err != nil {
@@ -230,27 +251,13 @@ func drainNode(ctx context.Context, logger *slog.Logger, kube kubernetes.Interfa
 	helper := &drain.Helper{
 		Ctx:                 ctx,
 		Client:              kube,
-		Force:               false, // Ignores orphaned unmanaged pods
-		GracePeriodSeconds:  -1,    // Honors user-configured workload termination grace limits
-		IgnoreAllDaemonSets: true,  // Prevents eviction loop lockups targeting itself
-		DeleteEmptyDirData:  true,  // Drops ephemeral cache disks
+		Force:               true, // Ignores orphaned unmanaged pods
+		GracePeriodSeconds:  -1,   // Honors user-configured workload termination grace limits
+		IgnoreAllDaemonSets: true, // Prevents eviction loop lockups targeting itself
+		DeleteEmptyDirData:  true, // Drops ephemeral cache disks
 		Out:                 os.Stdout,
 		ErrOut:              os.Stderr,
 	}
-
-	// drainer := &kubectldrain.Helper{
-	// 	Client:                          client,
-	// 	Ctx:                             context.Background(),
-	// 	GracePeriodSeconds:              drainGracePeriod,
-	// 	PodSelector:                     drainPodSelector,
-	// 	SkipWaitForDeleteTimeoutSeconds: skipWaitForDeleteTimeoutSeconds,
-	// 	Force:                           true,
-	// 	DeleteEmptyDirData:              true,
-	// 	IgnoreAllDaemonSets:             true,
-	// 	ErrOut:                          os.Stderr,
-	// 	Out:                             os.Stdout,
-	// 	Timeout:                         drainTimeout,
-	// }
 
 	logger.Info("draining node...")
 
@@ -282,46 +289,62 @@ func ensureUncordoned(ctx context.Context, logger *slog.Logger, kube kubernetes.
 }
 
 // tryAcquireLease evaluates distributed locks across cluster boundaries
-func tryAcquireLease(ctx context.Context, kube kubernetes.Interface, config Config) (bool, error) {
+func tryAcquireLease(ctx context.Context, kube kubernetes.Interface, config Config) (*coordinationv1.Lease, error) {
 	leases := kube.CoordinationV1().Leases(config.LeaseNamespace)
 
 	lease, err := leases.Get(ctx, config.LeaseName, metav1.GetOptions{})
 	if k8serrors.IsNotFound(err) {
 		// Bootstrap initialization if Lease payload is missing inside state layer
+		leaseDuration := int32(config.LeaseDuration.Seconds())
 		newLease := &coordinationv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{Name: config.LeaseName, Namespace: config.LeaseNamespace},
 			Spec: coordinationv1.LeaseSpec{
-				HolderIdentity: &config.NodeName,
-				AcquireTime:    &metav1.MicroTime{Time: config.Clock.Now()},
+				HolderIdentity:       &config.NodeName,
+				AcquireTime:          &metav1.MicroTime{Time: config.Clock.Now()},
+				RenewTime:            &metav1.MicroTime{Time: config.Clock.Now()},
+				LeaseDurationSeconds: &leaseDuration,
 			},
 		}
 		_, err := leases.Create(ctx, newLease, metav1.CreateOptions{})
 
 		if k8serrors.IsAlreadyExists(err) {
 			// we lost the race
-			return false, nil
+			return nil, nil
+		} else if err != nil {
+			return nil, err
 		}
 
-		return err == nil, err
+		return newLease, err
 	} else if err != nil {
-		return false, err
+		return nil, err
+	}
+
+	isExpired := false
+	if lease.Spec.RenewTime != nil && lease.Spec.LeaseDurationSeconds != nil {
+		expiryTime := lease.Spec.RenewTime.Time.Add(time.Duration(*lease.Spec.LeaseDurationSeconds) * time.Second)
+		isExpired = config.Clock.Now().After(expiryTime)
 	}
 
 	// Evaluate existing record authorization status
-	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" || *lease.Spec.HolderIdentity == config.NodeName {
+	if lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity == "" || *lease.Spec.HolderIdentity == config.NodeName || isExpired {
+		leaseDuration := int32(config.LeaseDuration.Seconds())
 		lease.Spec.HolderIdentity = &config.NodeName
 		lease.Spec.AcquireTime = &metav1.MicroTime{Time: config.Clock.Now()}
+		lease.Spec.RenewTime = &metav1.MicroTime{Time: config.Clock.Now()}
+		lease.Spec.LeaseDurationSeconds = &leaseDuration
 
 		_, err := leases.Update(ctx, lease, metav1.UpdateOptions{})
 		if k8serrors.IsConflict(err) {
 			// we lost the race
-			return false, nil
+			return nil, nil
+		} else if err != nil {
+			return nil, err
 		}
 
-		return err == nil, err
+		return lease, err
 	}
 
-	return false, nil
+	return nil, nil
 }
 
 // ensureLeaseReleased clears explicit distributed resource lock definitions
@@ -341,47 +364,4 @@ func ensureLeaseReleased(ctx context.Context, logger *slog.Logger, kube kubernet
 		return err
 	}
 	return nil
-}
-
-// isInMaintenanceWindow verifies time validation matching localized rules
-func isInMaintenanceWindow(now time.Time, startStr, endStr, daysStr string) bool {
-	if startStr == "" && endStr == "" && daysStr == "" {
-		return true
-	}
-
-	if daysStr != "" {
-		currentDay := now.Weekday().String()
-		if !strings.Contains(strings.ToLower(daysStr), strings.ToLower(currentDay[:3])) {
-			return false
-		}
-	}
-
-	if startStr != "" && endStr != "" {
-		nowMins := now.Hour()*60 + now.Minute()
-		startMins, err1 := parseTimeToMinutes(startStr)
-		endMins, err2 := parseTimeToMinutes(endStr)
-		if err1 != nil || err2 != nil {
-			return false // Failsafe behavior blocks accidental daytime upgrades on bad cron strings
-		}
-
-		if startMins <= endMins {
-			if nowMins < startMins || nowMins > endMins {
-				return false
-			}
-		} else {
-			// Evaluates ranges crossing midnight limits safely
-			if nowMins < startMins && nowMins > endMins {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func parseTimeToMinutes(timeStr string) (int, error) {
-	t, err := time.Parse("15:04", strings.TrimSpace(timeStr))
-	if err != nil {
-		return 0, err
-	}
-	return t.Hour()*60 + t.Minute(), nil
 }

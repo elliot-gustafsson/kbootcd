@@ -52,28 +52,18 @@ func setupDefaultLogger(level, format string) {
 }
 
 var (
-	nodeName       string
 	logLevel       string
 	logFormat      string
 	configPath     string
 	leaseName      string
 	leaseNamespace string
+	leaseDuration  time.Duration
 	tickerInterval time.Duration
 	rebootDays     []string
 	rebootStart    string
 	rebootEnd      string
 	timezone       string
 )
-
-var everyWeekDay = []string{
-	time.Sunday.String(),
-	time.Monday.String(),
-	time.Tuesday.String(),
-	time.Wednesday.String(),
-	time.Thursday.String(),
-	time.Friday.String(),
-	time.Saturday.String(),
-}
 
 var logLevels = []string{
 	slog.LevelDebug.String(),
@@ -98,6 +88,7 @@ func main() {
 	rootCmd.Flags().StringVar(&configPath, "config-path", "/etc/bootc-config/target_image", "Path to the ConfigMap mount containing the desired digest")
 	rootCmd.Flags().StringVar(&leaseName, "lease-name", "bootc-upgrade-lock", "Name of the cluster-wide coordination lease")
 	rootCmd.Flags().StringVar(&leaseNamespace, "lease-namespace", "kube-system", "Namespace of the coordination lease")
+	rootCmd.Flags().DurationVar(&leaseDuration, "lease-duration", 60*time.Minute, "Lease duration")
 	rootCmd.Flags().DurationVar(&tickerInterval, "interval", 5*time.Minute, "How often to run the reconciliation loop")
 
 	rootCmd.PersistentFlags().StringSliceVar(&rebootDays, "reboot-days", controller.EveryDay, "schedule reboot on these days")
@@ -138,6 +129,7 @@ func run(ctx context.Context) error {
 		TargetImageConfigPath: configPath,
 		LeaseName:             leaseName,
 		LeaseNamespace:        leaseNamespace,
+		LeaseDuration:         leaseDuration,
 	}
 
 	config.Window, err = controller.BuildTimeWindow(rebootStart, rebootEnd, rebootDays, timezone)
