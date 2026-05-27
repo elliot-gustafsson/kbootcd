@@ -50,9 +50,19 @@ type ContainerImage struct {
 }
 
 func (t *StateImage) GetDigest() (d name.Digest, err error) {
+	ref, err := name.ParseReference(t.Image.Image)
+	if err != nil {
+		return name.Digest{}, err
+	}
+
+	d, ok := ref.(name.Digest)
+	if ok {
+		return d, nil
+	}
+
 	d, err = name.NewDigest(fmt.Sprintf("%s@%s", t.Image.Image, t.ImageDigest))
 	if err != nil {
-		return d, fmt.Errorf("error parsing booted image digest, err: %w", err)
+		return d, err
 	}
 	return
 }
