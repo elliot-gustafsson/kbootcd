@@ -48,6 +48,8 @@ type Config struct {
 	LeaseName             string
 	LeaseNamespace        string
 	LeaseDuration         time.Duration
+	RebootDelay           time.Duration
+	CooldownDelay         time.Duration
 	Clock                 clock.PassiveClock
 	Window                Window
 }
@@ -113,14 +115,23 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 	}
 
 	if !reboot {
-		err := ensureUncordoned(ctx, logger, kube, config)
+		lease, err := getLease(ctx, kube, config)
 		if err != nil {
-			return fmt.Errorf("failed uncordoning node, err: %w", err)
+			return fmt.Errorf("failed getting lease, err: %w", err)
 		}
 
-		err = ensureLeaseReleased(ctx, logger, kube, config)
-		if err != nil {
-			return fmt.Errorf("failed releasing lease lock, err: %w", err)
+		// Only run cleanup if we're leader
+		if lease != nil && lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity == config.NodeName {
+
+			err := ensureUncordoned(ctx, logger, kube, config)
+			if err != nil {
+				return fmt.Errorf("failed uncordoning node, err: %w", err)
+			}
+
+			err = finalizeLeaseState(ctx, logger, kube, lease, config)
+			if err != nil {
+				return fmt.Errorf("failed finalizing lease lock state, err: %w", err)
+			}
 		}
 		return nil
 	}
@@ -159,6 +170,12 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 	}
 
 	logger.Info("workload eviction finalized, issuing reboot...")
+
+	if config.RebootDelay > 0 {
+		logger.Info("delaying reboot for " + config.RebootDelay.String())
+		time.Sleep(config.RebootDelay)
+	}
+
 	return host.Reboot(ctx, cmder)
 }
 
@@ -206,6 +223,11 @@ func isClusterHealthy(ctx context.Context, kube kubernetes.Interface, ourNodeNam
 		// we don't care about our own node's status
 		if node.Name == ourNodeName {
 			continue
+		}
+
+		// cluster should be considered "unhealthy" if a node is unschedulable
+		if node.Spec.Unschedulable {
+			return false, nil
 		}
 
 		isReady := false
@@ -280,34 +302,56 @@ func drainNode(ctx context.Context, logger *slog.Logger, kube kubernetes.Interfa
 
 // ensureUncordoned updates base status payloads to resume scheduler tracking
 func ensureUncordoned(ctx context.Context, logger *slog.Logger, kube kubernetes.Interface, config Config) error {
-	node, err := kube.CoreV1().Nodes().Get(ctx, config.NodeName, metav1.GetOptions{})
-	if err != nil {
-		return err
-	}
-	if !node.Spec.Unschedulable {
-		return nil
-	}
 
-	isReady := false
-	for _, condition := range node.Status.Conditions {
-		if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
-			isReady = true
-			break
+	timeoutCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		node, err := kube.CoreV1().Nodes().Get(timeoutCtx, config.NodeName, metav1.GetOptions{})
+		if err == nil {
+			if !node.Spec.Unschedulable {
+				// Node is already uncordoned
+				return nil
+			}
+			isReady := false
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+					isReady = true
+					break
+				}
+			}
+
+			if isReady {
+				logger.Info("target state validated. uncordoning node...")
+
+				patch := []byte(`{"spec":{"unschedulable":false}}`)
+				_, err = kube.CoreV1().Nodes().Patch(timeoutCtx, config.NodeName, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+				return err
+			}
+
+			logger.Info("node is not ready yet, waiting...")
+		} else {
+			logger.Info("failed to get node status, retrying...", "error", err.Error())
+		}
+		select {
+		case <-timeoutCtx.Done():
+			return fmt.Errorf("timed out waiting for node to become ready and uncordon")
+		case <-ticker.C:
+			continue
 		}
 	}
-	if !isReady {
-		logger.Info("node not ready, queueing uncordon...")
-		return nil
-	}
+}
 
-	logger.Info("target state validated. uncordoning node scheduling attributes...")
-	patch := []byte(`{"spec":{"unschedulable":false}}`)
-	_, err = kube.CoreV1().Nodes().Patch(ctx, config.NodeName, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
-	if err != nil {
-		return err
+func getLease(ctx context.Context, kube kubernetes.Interface, config Config) (*coordinationv1.Lease, error) {
+	leases := kube.CoordinationV1().Leases(config.LeaseNamespace)
+	lease, err := leases.Get(ctx, config.LeaseName, metav1.GetOptions{})
+	if k8serrors.IsNotFound(err) {
+		return nil, nil
 	}
-	logger.Info("uncordoned node")
-	return nil
+	return lease, err
 }
 
 // tryAcquireLease evaluates distributed locks across cluster boundaries
@@ -369,24 +413,26 @@ func tryAcquireLease(ctx context.Context, kube kubernetes.Interface, config Conf
 	return nil, nil
 }
 
-// ensureLeaseReleased clears explicit distributed resource lock definitions
-func ensureLeaseReleased(ctx context.Context, logger *slog.Logger, kube kubernetes.Interface, config Config) error {
-	leases := kube.CoordinationV1().Leases(config.LeaseNamespace)
-	lease, err := leases.Get(ctx, config.LeaseName, metav1.GetOptions{})
-	if k8serrors.IsNotFound(err) {
-		return nil
-	} else if err != nil {
-		return err
-	}
+func finalizeLeaseState(ctx context.Context, logger *slog.Logger, kube kubernetes.Interface, lease *coordinationv1.Lease, config Config) error {
+	if config.CooldownDelay > 0 {
+		logger.Info("entering cooldown phase to delay subsequent node upgrades", "delay", config.CooldownDelay.String())
 
-	if lease.Spec.HolderIdentity != nil && *lease.Spec.HolderIdentity == config.NodeName {
+		delayStr := fmt.Sprintf("cooldown:%s", config.NodeName)
+		delaySecs := int32(config.CooldownDelay.Seconds())
+
+		lease.Spec.HolderIdentity = &delayStr
+		lease.Spec.RenewTime = &metav1.MicroTime{Time: config.Clock.Now()}
+		lease.Spec.LeaseDurationSeconds = &delaySecs
+	} else {
 		logger.Info("releasing cluster upgrade lock object...")
 		lease.Spec.HolderIdentity = nil
-		_, err := leases.Update(ctx, lease, metav1.UpdateOptions{})
-		if err != nil {
-			return err
-		}
-		logger.Info("relased lease lock")
 	}
+
+	leases := kube.CoordinationV1().Leases(config.LeaseNamespace)
+	_, err := leases.Update(ctx, lease, metav1.UpdateOptions{})
+	if err != nil {
+		return err
+	}
+	logger.Info("released lease lock")
 	return nil
 }

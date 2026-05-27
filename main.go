@@ -60,6 +60,8 @@ var (
 	leaseNamespace string
 	leaseDuration  time.Duration
 	tickerInterval time.Duration
+	rebootDelay    time.Duration
+	cooldownDelay  time.Duration
 	rebootDays     []string
 	rebootStart    string
 	rebootEnd      string
@@ -91,6 +93,8 @@ func main() {
 	rootCmd.Flags().StringVar(&leaseNamespace, "lease-namespace", "kube-system", "Namespace of the coordination lease")
 	rootCmd.Flags().DurationVar(&leaseDuration, "lease-duration", 60*time.Minute, "Lease duration")
 	rootCmd.Flags().DurationVar(&tickerInterval, "interval", 5*time.Minute, "How often to run the reconciliation loop")
+	rootCmd.Flags().DurationVar(&rebootDelay, "reboot-delay", 0, "Delay reboot for this duration")
+	rootCmd.Flags().DurationVar(&cooldownDelay, "cooldown-delay", 0, "Delay the release of the lease lock for this duration after a successful update")
 
 	rootCmd.PersistentFlags().StringSliceVar(&rebootDays, "reboot-days", controller.EveryDay, "schedule reboot on these days")
 	rootCmd.PersistentFlags().StringVar(&rebootStart, "start-time", "0:00", "schedule reboot only after this time of day")
@@ -132,6 +136,8 @@ func run(ctx context.Context) error {
 		LeaseName:             leaseName,
 		LeaseNamespace:        leaseNamespace,
 		LeaseDuration:         leaseDuration,
+		RebootDelay:           rebootDelay,
+		CooldownDelay:         cooldownDelay,
 	}
 
 	config.Window, err = controller.BuildTimeWindow(rebootStart, rebootEnd, rebootDays, timezone)
