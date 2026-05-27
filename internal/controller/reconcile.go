@@ -64,9 +64,14 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 		return fmt.Errorf("error getting bootc status, err: %w", err)
 	}
 
+	bootedImage, err := status.Booted.Image.GetDigest()
+	if err != nil {
+		slog.Error("failed parsing booted image", "error", err.Error())
+	}
+
 	logger := slog.With(
 		"node", config.NodeName,
-		"booted_image", status.Booted.Image.Image.Image,
+		"booted_image", bootedImage,
 		"desired_image", desiredImage,
 	)
 
@@ -112,13 +117,11 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 		if err != nil {
 			return fmt.Errorf("failed uncordoning node, err: %w", err)
 		}
-		logger.Info("uncordoned node")
 
 		err = ensureLeaseReleased(ctx, logger, kube, config)
 		if err != nil {
 			return fmt.Errorf("failed releasing lease lock, err: %w", err)
 		}
-		logger.Info("relased lease lock")
 		return nil
 	}
 
@@ -300,7 +303,11 @@ func ensureUncordoned(ctx context.Context, logger *slog.Logger, kube kubernetes.
 	logger.Info("target state validated. uncordoning node scheduling attributes...")
 	patch := []byte(`{"spec":{"unschedulable":false}}`)
 	_, err = kube.CoreV1().Nodes().Patch(ctx, config.NodeName, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
-	return err
+	if err != nil {
+		return err
+	}
+	logger.Info("uncordoned node")
+	return nil
 }
 
 // tryAcquireLease evaluates distributed locks across cluster boundaries
@@ -376,7 +383,10 @@ func ensureLeaseReleased(ctx context.Context, logger *slog.Logger, kube kubernet
 		logger.Info("releasing cluster upgrade lock object...")
 		lease.Spec.HolderIdentity = nil
 		_, err := leases.Update(ctx, lease, metav1.UpdateOptions{})
-		return err
+		if err != nil {
+			return err
+		}
+		logger.Info("relased lease lock")
 	}
 	return nil
 }
