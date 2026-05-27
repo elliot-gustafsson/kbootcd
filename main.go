@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/utils/clock"
 )
 
 func setupDefaultLogger(level, format string) {
@@ -125,6 +126,7 @@ func run(ctx context.Context) error {
 	}
 
 	config := controller.Config{
+		Clock:                 clock.RealClock{},
 		NodeName:              nodeName,
 		TargetImageConfigPath: configPath,
 		LeaseName:             leaseName,
