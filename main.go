@@ -139,7 +139,7 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("error building time window, err: %w", err)
 	}
 
-	slog.Info("Starting kbootcd on node %s. Reconciliation interval: %v", nodeName, tickerInterval)
+	slog.Info("Starting kbootcd", "node", nodeName, "interval", tickerInterval)
 
 	cmder := command.NewCommander()
 	// Run immediate baseline check on startup
@@ -149,12 +149,16 @@ func run(ctx context.Context) error {
 	}
 
 	ticker := time.NewTicker(tickerInterval)
-	for range ticker.C {
-		err := controller.Reconcile(ctx, cmder, clientset, config)
-		if err != nil {
-			slog.Error("error during reconciliation", "error", err.Error())
+	for {
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			err := controller.Reconcile(ctx, cmder, clientset, config)
+			if err != nil {
+				slog.Error("error during reconciliation", "error", err.Error())
+			}
 		}
 	}
-
-	return nil
 }

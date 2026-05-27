@@ -66,7 +66,7 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 
 	logger := slog.With(
 		"node", config.NodeName,
-		"booted_image", fmt.Sprintf("%s@%s", status.Booted.Image.Image.Image, status.Booted.Image.ImageDigest),
+		"booted_image", status.Booted.Image.Image.Image,
 		"desired_image", desiredImage,
 	)
 
@@ -110,12 +110,15 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 	if !reboot {
 		err := ensureUncordoned(ctx, logger, kube, config)
 		if err != nil {
-			logger.Warn("failed uncordoning node", "error", err)
+			return fmt.Errorf("failed uncordoning node, err: %w", err)
 		}
+		logger.Info("uncordoned node")
+
 		err = ensureLeaseReleased(ctx, logger, kube, config)
 		if err != nil {
-			logger.Warn("failed releasing lease lock", "error", err)
+			return fmt.Errorf("failed releasing lease lock, err: %w", err)
 		}
+		logger.Info("relased lease lock")
 		return nil
 	}
 
@@ -279,6 +282,18 @@ func ensureUncordoned(ctx context.Context, logger *slog.Logger, kube kubernetes.
 		return err
 	}
 	if !node.Spec.Unschedulable {
+		return nil
+	}
+
+	isReady := false
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+			isReady = true
+			break
+		}
+	}
+	if !isReady {
+		logger.Info("node not ready, queueing uncordon...")
 		return nil
 	}
 
