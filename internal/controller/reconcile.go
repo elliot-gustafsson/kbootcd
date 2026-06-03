@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -53,6 +54,9 @@ type Config struct {
 	Clock                 clock.PassiveClock
 	Window                Window
 }
+
+// ErrRebootInitiated is returned when the reconciliation successfully triggers a host reboot.
+var ErrRebootInitiated = errors.New("reboot initiated")
 
 func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Interface, config Config) error {
 	err := waitForNodeReady(ctx, kube, config.NodeName)
@@ -181,7 +185,12 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 		time.Sleep(config.RebootDelay)
 	}
 
-	return host.Reboot(ctx, cmder)
+	err = host.Reboot(ctx, cmder)
+	if err != nil {
+		return fmt.Errorf("failed to issue reboot command: %w", err)
+	}
+
+	return ErrRebootInitiated
 }
 
 func waitForNodeReady(ctx context.Context, kube kubernetes.Interface, nodeName string) error {
@@ -302,9 +311,11 @@ func drainNode(ctx context.Context, logger *slog.Logger, kube kubernetes.Interfa
 			case <-t:
 				lease.Spec.HolderIdentity = &config.NodeName
 				lease.Spec.RenewTime = &metav1.MicroTime{Time: config.Clock.Now()}
-				_, err := leases.Update(ctx, lease, metav1.UpdateOptions{})
+				updatedLease, err := leases.Update(ctx, lease, metav1.UpdateOptions{})
 				if err != nil {
 					logger.Error("error refreshing lease", "error", err.Error())
+				} else {
+					lease = updatedLease // <-- Save the updated lease with the new resourceVersion
 				}
 			}
 		}
@@ -381,7 +392,7 @@ func tryAcquireLease(ctx context.Context, kube kubernetes.Interface, config Conf
 				LeaseDurationSeconds: &leaseDuration,
 			},
 		}
-		_, err := leases.Create(ctx, newLease, metav1.CreateOptions{})
+		createdLease, err := leases.Create(ctx, newLease, metav1.CreateOptions{})
 
 		if k8serrors.IsAlreadyExists(err) {
 			// we lost the race
@@ -390,7 +401,7 @@ func tryAcquireLease(ctx context.Context, kube kubernetes.Interface, config Conf
 			return nil, err
 		}
 
-		return newLease, err
+		return createdLease, err
 	} else if err != nil {
 		return nil, err
 	}
@@ -409,7 +420,7 @@ func tryAcquireLease(ctx context.Context, kube kubernetes.Interface, config Conf
 		lease.Spec.RenewTime = &metav1.MicroTime{Time: config.Clock.Now()}
 		lease.Spec.LeaseDurationSeconds = &leaseDuration
 
-		_, err := leases.Update(ctx, lease, metav1.UpdateOptions{})
+		updatedLease, err := leases.Update(ctx, lease, metav1.UpdateOptions{})
 		if k8serrors.IsConflict(err) {
 			// we lost the race
 			return nil, nil
@@ -417,7 +428,7 @@ func tryAcquireLease(ctx context.Context, kube kubernetes.Interface, config Conf
 			return nil, err
 		}
 
-		return lease, err
+		return updatedLease, err
 	}
 
 	return nil, nil

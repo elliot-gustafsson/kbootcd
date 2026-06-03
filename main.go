@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -163,6 +164,10 @@ func run(ctx context.Context) error {
 		case <-ticker.C:
 			err := controller.Reconcile(ctx, cmder, clientset, config)
 			if err != nil {
+				if errors.Is(err, controller.ErrRebootInitiated) {
+					slog.Info("reboot issued successfully. Halting reconciliation and waiting for node shutdown...")
+					return nil
+				}
 				slog.Error("error during reconciliation", "error", err.Error())
 			}
 		}
