@@ -145,7 +145,7 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("error building time window, err: %w", err)
 	}
 
-	slog.Info("Starting kbootcd", "node", nodeName, "interval", tickerInterval)
+	slog.Info("Starting kbootcd", "node", nodeName, "interval", tickerInterval.String())
 
 	cmder := command.NewCommander()
 	// Run immediate baseline check on startup

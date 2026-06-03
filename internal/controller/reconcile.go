@@ -55,6 +55,11 @@ type Config struct {
 }
 
 func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Interface, config Config) error {
+	err := waitForNodeReady(ctx, kube, config.NodeName)
+	if err != nil {
+		return err
+	}
+
 	desiredBytes, err := os.ReadFile(config.TargetImageConfigPath)
 	if err != nil {
 		return fmt.Errorf("error reading target config file at %s, err: %w", config.TargetImageConfigPath, err)
@@ -177,6 +182,40 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 	}
 
 	return host.Reboot(ctx, cmder)
+}
+
+func waitForNodeReady(ctx context.Context, kube kubernetes.Interface, nodeName string) error {
+	timeoutCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		_, err := kube.Discovery().ServerVersion()
+		if err == nil {
+			node, err := kube.CoreV1().Nodes().Get(timeoutCtx, nodeName, metav1.GetOptions{})
+			if err == nil {
+				for _, condition := range node.Status.Conditions {
+					if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+						return nil
+					}
+				}
+				slog.Info("network is up, but node is not ready yet, waiting...", "node", nodeName)
+			} else {
+				slog.Info("failed to get node status, waiting...", "node", nodeName, "error", err.Error())
+			}
+		} else {
+			slog.Info("waiting for network/api-server...", "node", nodeName, "error", err.Error())
+		}
+
+		select {
+		case <-timeoutCtx.Done():
+			return fmt.Errorf("timed out waiting for network and node readiness")
+		case <-ticker.C:
+			continue
+		}
+	}
 }
 
 func getRequiredAction(status *host.BootcStatus, desired string) (RequiredAction, error) {
@@ -302,47 +341,18 @@ func drainNode(ctx context.Context, logger *slog.Logger, kube kubernetes.Interfa
 
 // ensureUncordoned updates base status payloads to resume scheduler tracking
 func ensureUncordoned(ctx context.Context, logger *slog.Logger, kube kubernetes.Interface, config Config) error {
-
-	timeoutCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-	defer cancel()
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		node, err := kube.CoreV1().Nodes().Get(timeoutCtx, config.NodeName, metav1.GetOptions{})
-		if err == nil {
-			if !node.Spec.Unschedulable {
-				// Node is already uncordoned
-				return nil
-			}
-			isReady := false
-			for _, condition := range node.Status.Conditions {
-				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
-					isReady = true
-					break
-				}
-			}
-
-			if isReady {
-				logger.Info("target state validated. uncordoning node...")
-
-				patch := []byte(`{"spec":{"unschedulable":false}}`)
-				_, err = kube.CoreV1().Nodes().Patch(timeoutCtx, config.NodeName, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
-				return err
-			}
-
-			logger.Info("node is not ready yet, waiting...")
-		} else {
-			logger.Info("failed to get node status, retrying...", "error", err.Error())
-		}
-		select {
-		case <-timeoutCtx.Done():
-			return fmt.Errorf("timed out waiting for node to become ready and uncordon")
-		case <-ticker.C:
-			continue
-		}
+	node, err := kube.CoreV1().Nodes().Get(ctx, config.NodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get node status: %w", err)
 	}
+	if !node.Spec.Unschedulable {
+		// Node is already uncordoned
+		return nil
+	}
+	logger.Info("target state validated. uncordoning node...")
+	patch := []byte(`{"spec":{"unschedulable":false}}`)
+	_, err = kube.CoreV1().Nodes().Patch(ctx, config.NodeName, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+	return err
 }
 
 func getLease(ctx context.Context, kube kubernetes.Interface, config Config) (*coordinationv1.Lease, error) {
