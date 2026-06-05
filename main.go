@@ -165,7 +165,7 @@ func run(ctx context.Context) error {
 			err := controller.Reconcile(ctx, cmder, clientset, config)
 			if err != nil {
 				if errors.Is(err, controller.ErrRebootInitiated) {
-					slog.Info("reboot issued successfully. Halting reconciliation and waiting for node shutdown...")
+					slog.Info("reboot issued successfully, waiting for node shutdown...", "node", nodeName)
 					return nil
 				}
 				slog.Error("error during reconciliation", "error", err.Error())

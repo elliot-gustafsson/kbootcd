@@ -11,6 +11,7 @@ import (
 
 	"github.com/elliot-gustafsson/kbootcd/internal/command"
 	"github.com/elliot-gustafsson/kbootcd/internal/host"
+	"github.com/elliot-gustafsson/kbootcd/internal/slogwriter"
 	"github.com/google/go-containerregistry/pkg/name"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -147,7 +148,7 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 
 	// evaluate reboot window
 	if !config.Window.Contains(config.Clock.Now()) {
-		logger.Info("staging successful. outside allowed reboot window boundaries, pausing sequence.")
+		logger.Debug("staging successful. outside allowed reboot window boundaries, pausing sequence.")
 		return nil
 	}
 
@@ -156,7 +157,7 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 		return fmt.Errorf("error acquiring api lease, err: %w", err)
 	}
 	if lease == nil {
-		logger.Info("lock active on peer node, queueing drain execution...")
+		logger.Debug("lock active on peer node, queueing drain execution...")
 		return nil
 	}
 
@@ -172,7 +173,6 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 		logger.Warn("cluster is degraded. holding lock and pausing upgrade sequence until cluster is healthy.")
 		return nil
 	}
-	logger.Info("cluster health verified. starting drain...")
 
 	if err := drainNode(ctx, logger, kube, lease, config); err != nil {
 		return fmt.Errorf("error draining node, err: %w", err)
@@ -333,8 +333,8 @@ func drainNode(ctx context.Context, logger *slog.Logger, kube kubernetes.Interfa
 		GracePeriodSeconds:  -1,   // Honors user-configured workload termination grace limits
 		IgnoreAllDaemonSets: true, // Prevents eviction loop lockups targeting itself
 		DeleteEmptyDirData:  true, // Drops ephemeral cache disks
-		Out:                 os.Stdout,
-		ErrOut:              os.Stderr,
+		Out:                 slogwriter.New(logger, slog.LevelDebug),
+		ErrOut:              slogwriter.New(logger, slog.LevelError),
 	}
 
 	logger.Info("draining node...")
@@ -454,6 +454,5 @@ func finalizeLeaseState(ctx context.Context, logger *slog.Logger, kube kubernete
 	if err != nil {
 		return err
 	}
-	logger.Info("released lease lock")
 	return nil
 }
