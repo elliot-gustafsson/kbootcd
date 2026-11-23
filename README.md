@@ -10,10 +10,11 @@ The daemon runs a reconciliation loop that continuously aligns the node's OS ima
 2. **Evaluate Current State:** It queries the host using `bootc status` to determine the currently booted and staged image layers.
 3. **Stage Update:** If the desired image differs from the booted image and is not yet staged, the agent executes `bootc switch` to stage the new OS image layer on the host.
 4. **Maintenance Window Validation:** If an update is staged and requires a reboot, the daemon waits for the host time to enter the configured maintenance window.
-5. **Cluster Coordination:** To prevent simultaneous node restarts, it attempts to acquire a distributed lock via a Kubernetes `Lease` object in the cluster.
-6. **Health Check:** It verifies that all other nodes in the cluster are in a `Ready` state before proceeding with node disruption.
-7. **Drain and Reboot:** After acquiring the lock and confirming cluster health, it safely cordons the node, evicts running workloads, and issues a host reboot.
-8. **Restore:** After the node reboots with the updated OS image, it automatically uncordons the node to resume scheduling and releases the distributed lock.
+5. **Control Plane Priority:** Worker nodes verify that all control plane nodes have confirmed they are up to date (via node annotations) before attempting to acquire the upgrade lock, while still staging OS image layers in parallel.
+6. **Cluster Coordination:** To prevent simultaneous node restarts, it attempts to acquire a distributed lock via a Kubernetes `Lease` object in the cluster.
+7. **Health Check:** It verifies that all other nodes in the cluster are in a `Ready` state before proceeding with node disruption.
+8. **Drain and Reboot:** After acquiring the lock and confirming cluster health, it safely cordons the node, evicts running workloads, and issues a host reboot.
+9. **Restore:** After the node reboots with the updated OS image, it automatically uncordons the node to resume scheduling and releases the distributed lock.
 
 ## Configuration
 

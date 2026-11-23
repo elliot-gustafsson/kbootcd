@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,16 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+const (
+	AnnotationLastUpToDate = "kbootcd/last-up-to-date"
+	AnnotationStagedAt     = "kbootcd/staged-at"
+
+	ControlPlaneRoleLabel = "node-role.kubernetes.io/control-plane"
+	MasterRoleLabel       = "node-role.kubernetes.io/master"
+
+	controlPlaneSyncGrace = 2 * time.Minute
 )
 
 type RequiredAction uint8
@@ -60,10 +71,11 @@ type Config struct {
 var ErrRebootInitiated = errors.New("reboot initiated")
 
 func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Interface, config Config) error {
-	err := waitForNodeReady(ctx, kube, config.NodeName)
+	node, err := waitForNodeReady(ctx, kube, config.NodeName)
 	if err != nil {
 		return err
 	}
+	isControlPlane := isControlPlaneNode(node)
 
 	desiredBytes, err := os.ReadFile(config.TargetImageConfigPath)
 	if err != nil {
@@ -75,6 +87,9 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 	if err != nil {
 		return fmt.Errorf("error getting bootc status, err: %w", err)
 	}
+
+	preStagedDigest := stagedDigest(&status)
+	postStagedDigest := preStagedDigest
 
 	bootedImage, err := status.Booted.Image.GetDigest()
 	if err != nil {
@@ -105,6 +120,7 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 		if err != nil {
 			return fmt.Errorf("error getting bootc status, err: %w", err)
 		}
+		postStagedDigest = stagedDigest(&postStageStatus)
 
 		if reboot {
 
@@ -143,13 +159,66 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 				return fmt.Errorf("failed finalizing lease lock state, err: %w", err)
 			}
 		}
+
+		if isControlPlane {
+			nowStr := config.Clock.Now().UTC().Format(time.RFC3339)
+			if err := setNodeAnnotation(ctx, kube, config.NodeName, AnnotationLastUpToDate, nowStr); err != nil {
+				return fmt.Errorf("failed setting %s annotation, err: %w", AnnotationLastUpToDate, err)
+			}
+		} else if node.Annotations[AnnotationStagedAt] != "" {
+			if err := removeNodeAnnotation(ctx, kube, config.NodeName, AnnotationStagedAt); err != nil {
+				return fmt.Errorf("failed removing %s annotation, err: %w", AnnotationStagedAt, err)
+			}
+		}
+
 		return nil
+	}
+
+	var workerStagedAt time.Time
+
+	if isControlPlane {
+		if node.Annotations[AnnotationLastUpToDate] != "" {
+			if err := removeNodeAnnotation(ctx, kube, config.NodeName, AnnotationLastUpToDate); err != nil {
+				return fmt.Errorf("failed removing %s annotation, err: %w", AnnotationLastUpToDate, err)
+			}
+		}
+	} else {
+		existingStagedAt := node.Annotations[AnnotationStagedAt]
+		if existingStagedAt != "" {
+			parsed, err := time.Parse(time.RFC3339, existingStagedAt)
+			if err != nil {
+				logger.Warn("invalid staged-at annotation on node, resetting", "value", existingStagedAt, "error", err)
+				existingStagedAt = ""
+			} else {
+				workerStagedAt = parsed
+			}
+		}
+
+		if preStagedDigest != postStagedDigest || existingStagedAt == "" {
+			now := config.Clock.Now().UTC().Truncate(time.Second)
+			nowStr := now.Format(time.RFC3339)
+			if err := setNodeAnnotation(ctx, kube, config.NodeName, AnnotationStagedAt, nowStr); err != nil {
+				return fmt.Errorf("failed setting %s annotation, err: %w", AnnotationStagedAt, err)
+			}
+			workerStagedAt = now
+		}
 	}
 
 	// evaluate reboot window
 	if !config.Window.Contains(config.Clock.Now()) {
 		logger.Debug("staging successful. outside allowed reboot window boundaries, pausing sequence.")
 		return nil
+	}
+
+	if !isControlPlane {
+		done, err := areControlPlaneNodesDone(ctx, logger, kube, workerStagedAt)
+		if err != nil {
+			return fmt.Errorf("error checking control plane upgrade status, err: %w", err)
+		}
+		if !done {
+			logger.Debug("waiting for control plane nodes to finish upgrading before acquiring lock...")
+			return nil
+		}
 	}
 
 	lease, err := tryAcquireLease(ctx, kube, config)
@@ -193,7 +262,7 @@ func Reconcile(ctx context.Context, cmder command.Commander, kube kubernetes.Int
 	return ErrRebootInitiated
 }
 
-func waitForNodeReady(ctx context.Context, kube kubernetes.Interface, nodeName string) error {
+func waitForNodeReady(ctx context.Context, kube kubernetes.Interface, nodeName string) (*corev1.Node, error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 
@@ -205,10 +274,8 @@ func waitForNodeReady(ctx context.Context, kube kubernetes.Interface, nodeName s
 		if err == nil {
 			node, err := kube.CoreV1().Nodes().Get(timeoutCtx, nodeName, metav1.GetOptions{})
 			if err == nil {
-				for _, condition := range node.Status.Conditions {
-					if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
-						return nil
-					}
+				if isNodeReady(node) {
+					return node, nil
 				}
 				slog.Info("network is up, but node is not ready yet, waiting...", "node", nodeName)
 			} else {
@@ -220,11 +287,125 @@ func waitForNodeReady(ctx context.Context, kube kubernetes.Interface, nodeName s
 
 		select {
 		case <-timeoutCtx.Done():
-			return fmt.Errorf("timed out waiting for network and node readiness")
+			return nil, fmt.Errorf("timed out waiting for network and node readiness")
 		case <-ticker.C:
 			continue
 		}
 	}
+}
+
+func stagedDigest(status *host.BootcStatus) string {
+	if status == nil || status.Staged == nil {
+		return ""
+	}
+	return status.Staged.Image.ImageDigest
+}
+
+func isControlPlaneNode(node *corev1.Node) bool {
+	if node == nil || node.Labels == nil {
+		return false
+	}
+	if val, ok := node.Labels[ControlPlaneRoleLabel]; ok && val != "false" {
+		return true
+	}
+	if val, ok := node.Labels[MasterRoleLabel]; ok && val != "false" {
+		return true
+	}
+	return false
+}
+
+func isNodeReady(node *corev1.Node) bool {
+	if node == nil {
+		return false
+	}
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == corev1.NodeReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func setNodeAnnotation(ctx context.Context, kube kubernetes.Interface, nodeName, key, value string) error {
+	patch, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"annotations": map[string]any{
+				key: value,
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = kube.CoreV1().Nodes().Patch(ctx, nodeName, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+	return err
+}
+
+func removeNodeAnnotation(ctx context.Context, kube kubernetes.Interface, nodeName, key string) error {
+	patch, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"annotations": map[string]any{
+				key: nil,
+			},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = kube.CoreV1().Nodes().Patch(ctx, nodeName, types.StrategicMergePatchType, patch, metav1.PatchOptions{})
+	return err
+}
+
+func areControlPlaneNodesDone(ctx context.Context, logger *slog.Logger, kube kubernetes.Interface, workerStagedAt time.Time) (bool, error) {
+	nodes, err := kube.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, fmt.Errorf("failed to list nodes: %w", err)
+	}
+
+	minMasterCheckTime := workerStagedAt.Add(controlPlaneSyncGrace)
+
+	for _, n := range nodes.Items {
+		if !isControlPlaneNode(&n) {
+			continue
+		}
+
+		if n.Spec.Unschedulable {
+			logger.Debug("control plane node is unschedulable, waiting...", "control_plane_node", n.Name)
+			return false, nil
+		}
+
+		if !isNodeReady(&n) {
+			logger.Debug("control plane node is not ready, waiting...", "control_plane_node", n.Name)
+			return false, nil
+		}
+
+		rawLastUpToDate := n.Annotations[AnnotationLastUpToDate]
+		if rawLastUpToDate == "" {
+			logger.Debug("control plane node has pending update or missing status annotation, waiting...", "control_plane_node", n.Name)
+			return false, nil
+		}
+
+		lastUpToDate, err := time.Parse(time.RFC3339, rawLastUpToDate)
+		if err != nil {
+			logger.Warn("control plane node has invalid last-up-to-date annotation, waiting...",
+				"control_plane_node", n.Name,
+				"value", rawLastUpToDate,
+				"error", err,
+			)
+			return false, nil
+		}
+
+		if !lastUpToDate.After(minMasterCheckTime) {
+			logger.Debug("waiting for control plane node to confirm up-to-date state after worker staged time",
+				"control_plane_node", n.Name,
+				"master_last_up_to_date", lastUpToDate,
+				"required_after", minMasterCheckTime,
+			)
+			return false, nil
+		}
+	}
+
+	return true, nil
 }
 
 func getRequiredAction(status *host.BootcStatus, desired string) (RequiredAction, error) {
@@ -278,16 +459,7 @@ func isClusterHealthy(ctx context.Context, kube kubernetes.Interface, ourNodeNam
 			return false, nil
 		}
 
-		isReady := false
-		for _, condition := range node.Status.Conditions {
-			if condition.Type == corev1.NodeReady {
-				if condition.Status == corev1.ConditionTrue {
-					isReady = true
-				}
-				break
-			}
-		}
-		if !isReady {
+		if !isNodeReady(&node) {
 			// cluster is degraded.
 			return false, nil
 		}

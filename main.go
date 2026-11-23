@@ -152,6 +152,10 @@ func run(ctx context.Context) error {
 	// Run immediate baseline check on startup
 	err = controller.Reconcile(ctx, cmder, clientset, config)
 	if err != nil {
+		if errors.Is(err, controller.ErrRebootInitiated) {
+			slog.Info("reboot issued successfully, waiting for node shutdown...", "node", nodeName)
+			return nil
+		}
 		slog.Error("error during initial reconciliation", "error", err.Error())
 	}
 
